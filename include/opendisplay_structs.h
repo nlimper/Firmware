@@ -21,7 +21,7 @@
  *
  *   OD_STRUCTS_VERSION  2.1   (MAJOR.MINOR spec marker for THIS file; see
  *                              VERSIONING POLICY below -- NOT sent on the wire)
- *   LAST CHANGED        2026-08-30
+ *   LAST CHANGED        2026-11-01
  *
  *   The two version schemes carried here are DISTINCT (see §6 Q2 of the plan):
  *     - OD_STRUCTS_VERSION_* : documents this spec file, like protocol.h's
@@ -88,6 +88,10 @@
  *     - SensorType 6 is nPM1300 (already used by another OpenDisplay firmware
  *       family); SensorType 7 is AHT20, publishing the same 3-byte
  *       temperature/humidity MSD value as SHT40. GPIO40 gates its supply.
+ *     - PanelIC values 78 OD_PANEL_IC_EP37_SPECTRA_720X480 (GDEH037E01 Spectra 6
+ *       3.7" 720x480), 79 OD_PANEL_IC_EP154_SPECTRA_240X240 (GDEH0154E01 Spectra 6
+ *       1.54" 240x240) and 80 OD_PANEL_IC_EP579YR_792X272 (GDEY0579F52 5.79"
+ *       B/W/Y/R, two IST7158 controllers). Backward-compatible enum addition.
  *     - Add each payload-layout change here as it lands. On the next version bump,
  *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -585,7 +589,7 @@ enum ColorScheme {
 };
 
 /** @enum PanelIC  @width 2
- *  @external bb_epaper (0-76 names track bb_epaper EP* panel identifiers); the
+ *  @external bb_epaper (0-80 names track bb_epaper EP* panel identifiers); the
  *  1000-1030 range comes from the M3 / EPD-nRF5 driver line; 3000+ from the
  *  FastEPD IT8951 / OpenDisplay runtime. Wire values are OpenDisplay-OWNED; each
  *  firmware maps value -> its bb_epaper EP* constant via a repo-local
@@ -669,6 +673,9 @@ enum PanelIC {
     OD_PANEL_IC_EP40_SPECTRA_400X600     = 74  , /**< @doc "GDEP040E01 Spectra 6 4\" 400x600" */
     OD_PANEL_IC_EP27_176X264             = 75  , /**< @doc "Badger2350 B/W 2.7\"" */
     OD_PANEL_IC_EP27_176X264_4GRAY       = 76  , /**< @doc "Badger2350 4-gray 2.7\"" */
+    OD_PANEL_IC_EP37_SPECTRA_720X480     = 78  , /**< @doc "GDEH037E01 Spectra 6 3.7\" 720x480" */
+    OD_PANEL_IC_EP154_SPECTRA_240X240    = 79  , /**< @doc "GDEH0154E01 Spectra 6 1.54\" 240x240" */
+    OD_PANEL_IC_EP579YR_792X272          = 80  , /**< @doc "GDEY0579F52 5.79\" B/W/Y/R" */
     OD_PANEL_IC_UC8176_420_BW            = 1000, /**< @doc "UC8176 4.2\" B/W (M3 / EPD-nRF5 driver line, values 1000-1030)" */
     OD_PANEL_IC_SSD1619_420_BWR          = 1001, /**< @doc "SSD1619 4.2\" B/W/R" */
     OD_PANEL_IC_UC8176_420_BWR           = 1002, /**< @doc "UC8176 4.2\" B/W/R" */
