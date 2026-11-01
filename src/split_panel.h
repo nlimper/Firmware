@@ -5,17 +5,22 @@
 #include <stdbool.h>
 
 // Dual-controller ("split buffer") e-paper panels — a single glass driven by two
-// controllers on separate chip-selects, each owning one half of every row.
-// Currently the Seeed reTerminal E1004's 13.3" 1200x1600 Spectra6 (T133A01) and
-// the 8.1" 1024x576 Spectra6.
+// controllers, each owning one half of every row. Two kinds:
+//  - controllers on separate chip-selects: the Seeed reTerminal E1004's 13.3"
+//    1200x1600 Spectra6 (T133A01) and the 8.1" 1024x576 Spectra6 (BWGBRY_SPLIT);
+//  - two IST7158s on one chip-select, picked with command 0xA2: the GDEY0579F52
+//    5.79" 792x272 B/W/Y/R, whose rows are also interleaved by the panel wiring.
+// Which panel is which, and how it is addressed, lives in one table in
+// split_panel.cpp (splitPanelVariant()).
 //
-// Selection is entirely at RUNTIME: splitPanelUsed() tests BBEP_SPLIT_BUFFER on
-// bbep.iFlags, which bbepSetPanelType() fills in from the panel table for whatever
-// panel_ic_type the device config names. There is no build flag — this code is
-// compiled into every target, and a device that is not configured for a split
-// panel simply never enters it. The predecessor of this file was gated on
-// BBEP_T133A01, a *bb_epaper* define rather than a firmware one, so repinning the
-// library silently compiled the whole panel away while the build still succeeded.
+// Selection is entirely at RUNTIME: splitPanelUsed() looks at the bb_epaper panel
+// (BBEP_SPLIT_BUFFER on bbep.iFlags, or the panel type), which bbepSetPanelType()
+// fills in from the panel table for whatever panel_ic_type the device config names.
+// There is no build flag — this code is compiled into every target, and a device
+// that is not configured for a split panel simply never enters it. The predecessor
+// of this file was gated on BBEP_T133A01, a *bb_epaper* define rather than a
+// firmware one, so repinning the library silently compiled the whole panel away
+// while the build still succeeded.
 //
 // BUFFERLESS. Image bytes go straight from the transport to SPI; nothing here
 // allocates a framebuffer. bb_epaper's own dual-controller writer
@@ -35,6 +40,13 @@
 
 /** True when the configured panel is dual-controller. Valid once bbepSetPanelType() has run. */
 bool splitPanelUsed(void);
+
+/**
+ * Native row to send as the i-th row of a half-plane. Identity except for panels
+ * with interleaved rows (h-1, 0, h-2, 1, ...). Lets bufferless renderers such as
+ * the boot screen emit rows in panel order; host images arrive already reordered.
+ */
+uint16_t splitPanelNativeRow(uint16_t i);
 
 /** CS2 GPIO from the device config (displays[0].cs_pin_2), defaulting to 2. */
 uint8_t splitPanelCs2Pin(void);
@@ -65,10 +77,11 @@ bool splitPanelGeometryOk(void);
 bool splitPanelBeginFrame(void);
 
 /**
- * Stream image bytes in OD_COLOR_SCHEME_BWGBRY_SPLIT wire order — the entire left
- * half-plane (h rows of native_width/4 bytes) followed by the entire right
- * half-plane. Crossing to the second controller happens here, at the half
- * boundary. Bytes past the end of the frame are dropped and the frame is flagged.
+ * Stream image bytes in split wire order — the entire left half-plane (h rows of
+ * half-width at the panel's bits per pixel, in splitPanelNativeRow() order)
+ * followed by the entire right half-plane. Crossing to the second controller
+ * happens here, at the half boundary. Bytes past the end of the frame are dropped
+ * and the frame is flagged.
  */
 void splitPanelSinkBytes(const uint8_t* data, uint32_t len);
 

@@ -983,7 +983,8 @@ bool writeBootScreenWithQr() {
         // Split half-pass: only paint the half we will emit (avoids 2× full-frame work).
         const uint16_t xPaint0 = splitStream ? (uint16_t)(halfPass * (w / 2u)) : (uint16_t)0;
         const uint16_t xPaint1 = splitStream ? (uint16_t)(xPaint0 + (w / 2u)) : w;
-        for (uint16_t y_native = 0; y_native < h; y_native++) {
+        for (uint16_t yi = 0; yi < h; yi++) {
+            const uint16_t y_native = splitStream ? splitPanelNativeRow(yi) : yi;
             if (splitStream) {
                 memset(row + (size_t)halfPass * splitHalfPitch,
                        colorPlanePass ? 0x00 : whiteValue, splitHalfPitch);

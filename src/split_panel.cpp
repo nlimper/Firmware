@@ -18,6 +18,8 @@ void bbepInitIO(BBEPDISP *pBBEP, uint8_t u8DC, uint8_t u8RST, uint8_t u8BUSY, ui
                 uint8_t u8MOSI, uint8_t u8SCK, uint32_t u32Speed);
 void bbepWaitBusy(BBEPDISP *pBBEP);
 bool bbepIsBusy(BBEPDISP *pBBEP);
+void bbepWakeUp(BBEPDISP *pBBEP);
+void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
 
 // Tripwires. splitPanelUsed() deliberately does NOT track a library define, so
 // these assert that the pieces we build on still exist. If bb_epaper reworks the
@@ -30,6 +32,29 @@ static_assert(BBEP_SPLIT_BUFFER == 0x0400,
               "bb_epaper: BBEP_SPLIT_BUFFER changed; split-panel dispatch must be revisited");
 static_assert(CMD_CS_NONE == 0xf8 && CMD_CS1 == 0xfb,
               "bb_epaper: cs_mode opcodes changed; the manual chip-select sequence must be revisited");
+
+// The one place that knows which panels are dual-controller and how their two
+// controllers are addressed. Everything below works from the variant.
+struct SplitPanelVariant {
+    bool selectByCommand;   // one CS, controllers picked with 0xA2 (IST7158); else CS1/CS2
+    uint8_t bitsPerPixel;   // 4 = Spectra 6 nibbles, 2 = B/W/Y/R
+    bool clampSpectra;      // drop nibble codes Spectra 6 does not define
+    bool interleavedRows;   // native rows go out as h-1, 0, h-2, 1, ... (panel wiring)
+    uint8_t colorScheme;    // DisplayConfig.color_scheme the host must send
+};
+
+// 13.3" 1200x1600 (T133A01) and 8.1" 1024x576 Spectra 6: two controllers on CS1/CS2
+static const SplitPanelVariant kSpectraDualCs = { false, 4, true, false, OD_COLOR_SCHEME_BWGBRY_SPLIT };
+// GDEY0579F52 5.79" 792x272 B/W/Y/R: two IST7158s on one CS, 0xA2 selects the target
+static const SplitPanelVariant kIst7158Dual = { true, 2, false, true, OD_COLOR_SCHEME_BWRY };
+
+static const SplitPanelVariant* splitPanelVariant(void) {
+    if (bbep.iFlags & BBEP_SPLIT_BUFFER) return &kSpectraDualCs;
+    if (bbep.type == EP579YR_792x272) return &kIst7158Dual;
+    return nullptr;
+}
+
+static const uint8_t IST7158_CMD_SELECT = 0xa2;   // 0x01 master, 0x02 slave, 0x00 both
 
 static bool s_geometryOk = false;
 static bool s_streamOpen = false;
@@ -56,13 +81,21 @@ static void buildNibbleLut(void) {
     s_lutReady = true;
 }
 
-// One controller's share of the frame: half-width rows at 4bpp, full height.
+// One controller's share of the frame: half-width rows, full height.
 static inline uint32_t halfPlaneBytes(void) {
-    return ((uint32_t)bbep.native_width / 4u) * (uint32_t)bbep.native_height;
+    const SplitPanelVariant* v = splitPanelVariant();
+    return ((uint32_t)bbep.native_width / 2u * v->bitsPerPixel / 8u) * (uint32_t)bbep.native_height;
 }
 
 bool splitPanelUsed(void) {
-    return (bbep.iFlags & BBEP_SPLIT_BUFFER) != 0;
+    return splitPanelVariant() != nullptr;
+}
+
+uint16_t splitPanelNativeRow(uint16_t i) {
+    const SplitPanelVariant* v = splitPanelVariant();
+    if (!v || !v->interleavedRows) return i;
+    const uint16_t h = (uint16_t)bbep.native_height;
+    return (i & 1) ? (uint16_t)(i >> 1) : (uint16_t)(h - 1u - (i >> 1));
 }
 
 uint8_t splitPanelCs2Pin(void) {
@@ -84,10 +117,11 @@ void splitPanelConfigureGeometry(void) {
     if (!splitPanelUsed()) return;
 
     const DisplayConfig& d = globalConfig.displays[0];
+    const SplitPanelVariant* v = splitPanelVariant();
     if (d.pixel_width != bbep.native_width || d.pixel_height != bbep.native_height ||
-        d.color_scheme != OD_COLOR_SCHEME_BWGBRY_SPLIT) {
-        od_log_error("ERROR: split panel requires a %dx%d bwgbry_split (8) display config",
-                     bbep.native_width, bbep.native_height);
+        d.color_scheme != v->colorScheme) {
+        od_log_error("ERROR: split panel requires a %dx%d display config with color_scheme %d",
+                     bbep.native_width, bbep.native_height, v->colorScheme);
         return;
     }
     s_geometryOk = true;
@@ -95,6 +129,17 @@ void splitPanelConfigureGeometry(void) {
 
 void splitPanelInitIo(void) {
     const DisplayConfig& d = globalConfig.displays[0];
+    if (splitPanelVariant()->selectByCommand) {
+        // Single chip select: the ordinary bring-up (init, reset, init again).
+        odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+        odWatchdogFeed();   // bbepInitIO sends pInitFull internally
+        bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
+        odWatchdogFeed();
+        bbepWakeUp(&bbep);
+        odWatchdogFeed();
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
+        return;
+    }
     // CS2 before initIO: bbepInitIO() finishes by sending the panel's init
     // sequence, whose CMD_CS1_CS2 opcodes need iCS2Pin already assigned or the
     // shared registers reach only the primary controller.
@@ -118,6 +163,19 @@ static inline void selectControllers(bool cs1, bool cs2) {
     digitalWrite(bbep.iCS2Pin, cs2 ? LOW : HIGH);
 }
 
+// Point the data phase at one controller and open its DTM. With command selection
+// the library keeps driving CS (cs_mode CMD_CS1); each controller gets its own
+// 0xA2 + DTM1 burst.
+static void openHalf(bool left) {
+    assumeAwake();
+    if (splitPanelVariant()->selectByCommand) {
+        bbepCMD2(&bbep, IST7158_CMD_SELECT, left ? 0x01 : 0x02);
+    } else {
+        selectControllers(left, !left);
+    }
+    bbepWriteCmd(&bbep, UC8151_DTM1);   // 0x10; also leaves DC HIGH == data mode
+}
+
 bool splitPanelBeginFrame(void) {
     if (s_streamOpen) splitPanelCloseFrame();
     s_onLeftHalf = true;
@@ -129,21 +187,16 @@ bool splitPanelBeginFrame(void) {
     // the previous refresh.
     if (bbepIsBusy(&bbep)) bbepWaitBusy(&bbep);
 
-    assumeAwake();
-    bbep.cs_mode = CMD_CS_NONE;
-    selectControllers(true, false);
-    bbepWriteCmd(&bbep, UC8151_DTM1);   // 0x10; also leaves DC HIGH == data mode
+    if (!splitPanelVariant()->selectByCommand) bbep.cs_mode = CMD_CS_NONE;
+    openHalf(true);
     s_streamOpen = true;
     return true;
 }
 
-// Cross to the second controller: releasing CS1 ends its burst, and the second
-// DTM opens the right half-plane.
+// Cross to the second controller: the second DTM opens the right half-plane.
 static bool advanceToRightHalf(void) {
     if (!s_streamOpen || !s_onLeftHalf) return false;
-    selectControllers(false, true);
-    assumeAwake();
-    bbepWriteCmd(&bbep, UC8151_DTM1);
+    openHalf(false);
     s_onLeftHalf = false;
     s_halfWritten = 0;
     return true;
@@ -152,7 +205,8 @@ static bool advanceToRightHalf(void) {
 void splitPanelSinkBytes(const uint8_t* data, uint32_t len) {
     if (!data || len == 0) return;
     if (!s_streamOpen) { s_faulted = true; return; }
-    buildNibbleLut();
+    const bool clamp = splitPanelVariant()->clampSpectra;
+    if (clamp) buildNibbleLut();
 
     const uint32_t half = halfPlaneBytes();
     // 512 B: one bbepWriteData -> SPI.transferBytes per chunk. Large enough to
@@ -178,8 +232,12 @@ void splitPanelSinkBytes(const uint8_t* data, uint32_t len) {
         if (run > len) run = len;
         if (run > sizeof(scratch)) run = (uint32_t)sizeof(scratch);
 
-        for (uint32_t i = 0; i < run; i++) scratch[i] = s_nibbleLut[data[i]];
-        bbepWriteData(&bbep, scratch, (int)run);   // CS_NONE: pure byte burst, no CS, no DC
+        if (clamp) {
+            for (uint32_t i = 0; i < run; i++) scratch[i] = s_nibbleLut[data[i]];
+            bbepWriteData(&bbep, scratch, (int)run);   // CS_NONE: pure byte burst, no CS, no DC
+        } else {
+            bbepWriteData(&bbep, (uint8_t*)data, (int)run);
+        }
 
         data += run;
         len -= run;
@@ -189,11 +247,15 @@ void splitPanelSinkBytes(const uint8_t* data, uint32_t len) {
 
 bool splitPanelCloseFrame(void) {
     if (!s_streamOpen) return false;
-    selectControllers(false, false);
-    // Unconditional restore, matching bbepWriteImage4bppDual's epilogue: handing
-    // CMD_CS_NONE back to library code that expects to drive CS itself means its
-    // writes reach no controller, silently.
-    bbep.cs_mode = CMD_CS1;
+    if (splitPanelVariant()->selectByCommand) {
+        bbepCMD2(&bbep, IST7158_CMD_SELECT, 0x00);   // refresh and power commands reach both
+    } else {
+        selectControllers(false, false);
+        // Unconditional restore, matching bbepWriteImage4bppDual's epilogue: handing
+        // CMD_CS_NONE back to library code that expects to drive CS itself means its
+        // writes reach no controller, silently.
+        bbep.cs_mode = CMD_CS1;
+    }
     s_streamOpen = false;
 
     const bool complete = !s_onLeftHalf && s_halfWritten >= halfPlaneBytes();
@@ -216,9 +278,11 @@ bool splitPanelCloseFrame(void) {
 void splitPanelPowerOff(void) {
     if (!splitPanelUsed()) return;
     // POFF to both controllers, then wait for the HV rails to bleed down before
-    // anything considers cutting VDD.
-    bbep.cs_mode = CMD_CS1_CS2;
+    // anything considers cutting VDD. With command selection 0xA2 0x00 is already
+    // in effect after splitPanelCloseFrame().
+    const bool byCs = !splitPanelVariant()->selectByCommand;
+    if (byCs) bbep.cs_mode = CMD_CS1_CS2;
     bbepCMD2(&bbep, UC8151_POFF, 0x00);
     bbepWaitBusy(&bbep);
-    bbep.cs_mode = CMD_CS1;
+    if (byCs) bbep.cs_mode = CMD_CS1;
 }
